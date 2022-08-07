@@ -1,8 +1,7 @@
-# import demistomock as demisto
+import demistomock as demisto
+from CommonServerPython import *
+from CommonServerUserPython import *
 
-# from CommonServerUserPython import *
-print('Hello CrowdStrike')
-''' IMPORTS '''
 import json
 import requests
 import base64
@@ -13,25 +12,18 @@ from typing import List, Callable
 from dateutil.parser import parse
 from typing import Dict, Tuple, Any, Optional, Union
 from threading import Timer
-# import config
 
 # Disable insecure warnings
 requests.packages.urllib3.disable_warnings()
 
 ''' GLOBALS/PARAMS '''
 INTEGRATION_NAME = 'CrowdStrike Falcon'
-# demisto = config.demisto
-global demisto
-global demistox
+CLIENT_ID        = demisto.params().get('client_id')
+SECRET           = demisto.params().get('secret')
+SERVER           = demisto.params()['url'][:-1] \
+                    if (demisto.params()['url'] and demisto.params()['url'].endswith('/')) \
+                    else demisto.params()['url']
 
-# print(globals().get('demisto'))
-print(f'CrowdStrike {demisto}')
-from CommonServerPython import *
-CLIENT_ID = demisto.params().get('client_id')
-SECRET = demisto.params().get('secret')
-# Remove trailing slash to prevent wrong URL path to service
-SERVER = demisto.params()['url'][:-1] if (demisto.params()['url'] and demisto.params()['url'].endswith('/')) else \
-    demisto.params()['url']
 # Should we use SSL
 USE_SSL = not demisto.params().get('insecure', False)
 # How many time before the first fetch to retrieve incidents
@@ -3815,7 +3807,7 @@ def get_detection_for_incident_command(incident_id: str) -> CommandResults:
 LOG('Command being called is {}'.format(demisto.command()))
 
 
-def main(ctx):
+def main():
     command = demisto.command()
     args = demisto.args()
     try:
@@ -3824,7 +3816,6 @@ def main(ctx):
             return_results(result)
         elif command == 'fetch-incidents':
             demisto.incidents(fetch_incidents())
-
         elif command in ('cs-device-ran-on', 'cs-falcon-device-ran-on'):
             return_results(get_indicator_device_id())
         elif demisto.command() == 'cs-falcon-search-device':
