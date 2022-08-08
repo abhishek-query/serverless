@@ -1,10 +1,8 @@
 from typing import cast, Optional, Tuple
-from DemistoClassApiModule.DemistoClassApiModule import Demisto
+from queryai.demisto import Demisto
+from queryai.logging import logger
 
-import logging, json
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+import json
 
 # This is the common interface each driver implements. Since drivers are modules, there
 # is no way for the type checker to ensure they have `main`. But this interface is here
@@ -18,7 +16,7 @@ def load_driver(name, context) -> Optional[Tuple[Driver, Demisto]]:
     driver = None
 
     # This must be setup before any drivers are loaded
-    import demistomock as demisto
+    import queryai.demistomock as demisto
     demisto.setup(context)
 
     # Drivers are in 'Packs/{name}/Integrations/{name}/{name}.py'. We *could*
@@ -31,7 +29,7 @@ def load_driver(name, context) -> Optional[Tuple[Driver, Demisto]]:
         import Packs.SplunkPy.Integrations.SplunkPy.SplunkPy as driver
 
     if driver is not None:
-        return (cast(Driver, driver), demisto)
+        return (cast(Driver, driver), cast(Demisto, demisto))
 
 def lambda_handler(event, _):
     body     = event.get('body')
