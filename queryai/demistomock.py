@@ -34,7 +34,7 @@ def __getattr__(attr):
         return getattr(_demisto, attr)
 
 def __setattr__(attr, value):
-    logger.debug('__setattr__', attr)
+    logger.debug(f'demistomock.__setattr__({attr}, {value}')
     if _demisto is not None:
         return setattr(_demisto, attr, value)
 
@@ -52,6 +52,6 @@ __builtins__['hasattr'] = _hasattr
 # When something has `import demistomock as demisto`, and then does something like
 # `demisto.hasattr(...)`, we will redirect it to the value created in `setup()` above
 def __hasattr__(attr):
-    logger.debug('__hasattr__', attr)
+    logger.debug(f'demistomock.__hasattr__({attr})')
     if _demisto is not None:
         return hasattr(_demisto, attr)
