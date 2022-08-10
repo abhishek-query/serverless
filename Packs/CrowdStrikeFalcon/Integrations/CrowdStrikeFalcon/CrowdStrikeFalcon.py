@@ -311,6 +311,7 @@ class CloudStrikeFalconApi:
         self.client_id = client_id
         self.client_secret = client_secret
         self.base_url = base_url
+        self._request_timeout = 1
 
     def __del__(self):
         """Make sure to close existing connections on exit."""
@@ -382,7 +383,7 @@ class CloudStrikeFalconApi:
                 "the credentials correctly."
             )
         else:
-            return response.get('access_token')
+            return response.json().get('access_token')
 
     def get_token(self):
         """
@@ -1395,7 +1396,7 @@ def search_device(filter_operator='AND'):
                 url_filter = "{url_filter}{operator}{inp_arg}:'{arg_val}'".format(url_filter=url_filter, operator=op,
                                                                                   inp_arg=k, arg_val=arg)
     raw_res = backend.get('/devices/queries/devices/v1', params={'filter': url_filter})
-    device_ids = raw_res.get('resources')
+    device_ids = raw_res.json().get('resources')
     if not device_ids:
         return None
     return backend.get('/devices/entities/devices/v1', params={'ids': device_ids})
@@ -2391,7 +2392,7 @@ def search_device_command():
     raw_res = search_device()
     if not raw_res:
         return create_entry_object(hr='Could not find any devices.')
-    devices = raw_res.get('resources')
+    devices = raw_res.json().get('resources')
 
     command_results = []
     for single_device in devices:
