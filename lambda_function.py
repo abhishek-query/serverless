@@ -19,10 +19,14 @@ def load_driver(name, context) -> Optional[Tuple[Driver, Demisto]]:
     import queryai.demistomock as demisto
     demisto.setup(context)
 
-    # Drivers are in 'Packs/{name}/Integrations/{name}/{name}.py'. We *could*
-    # read the source code, use `compile()`, then use `exec()`, but that has
-    # a non-zero risk of an attacker being able to make us run a Python script
-    # which we didn't intend to do. This also serves to validate the input.
+    # Drivers are in 'Packs/{name}/Integrations/{name}/{name}.py'. Previously we would load the
+    # source code, use `compile()`, then use `exec()`, but that has a non-zero risk of an attacker
+    # being able to make us run a Python script which we didn't intend to do. This also serves to
+    # validate the input.
+    #
+    # The downside is we'll have lots of if statements here. Maybe a better idea is to create a
+    # set with valid names and check for membership. If it belongs, then `open('Packs/{name}/..)`
+    # and compile/exec.
     if name == 'CrowdStrikeFalcon':
         import Packs.CrowdStrikeFalcon.Integrations.CrowdStrikeFalcon.CrowdStrikeFalcon as driver
     if name == 'SplunkPy':
