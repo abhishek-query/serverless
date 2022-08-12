@@ -384,7 +384,7 @@ class Demisto:
             json.dump(cmd, sys.stdout)
             sys.stdout.write('\n')
             sys.stdout.flush()
-            data = '{"context": {}}' #globals()['__readWhileAvailable']()
+            data = globals()['__readWhileAvailable']()
             error_index = data.find(SERVER_ERROR_MARKER)
             if error_index > -1:
                 offset = error_index + len(SERVER_ERROR_MARKER)
@@ -438,7 +438,6 @@ class Demisto:
             res = converted
         else:
             res.append(converted)
-        self.output = res
         self.__do_no_res({'type': 'result', 'results': res})
 
     def fetchResults(self, incidents_or_alerts):

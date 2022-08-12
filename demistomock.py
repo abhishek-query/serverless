@@ -1,0 +1,1 @@
+from queryai.demistomock import *

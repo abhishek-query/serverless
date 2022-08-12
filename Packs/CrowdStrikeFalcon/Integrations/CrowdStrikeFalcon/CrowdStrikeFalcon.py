@@ -1,32 +1,112 @@
-# import demistomock as demisto
+import demistomock as demisto
+from CommonServerPython import *
+from CommonServerUserPython import *
 
-# from CommonServerUserPython import *
-print('Hello CrowdStrike')
 ''' IMPORTS '''
-import json
-import requests
 import base64
 import email
-from enum import Enum
 import hashlib
-from typing import List, Callable
+import json
+import requests
+from datetime import datetime
 from dateutil.parser import parse
-from typing import Dict, Tuple, Any, Optional, Union
+from enum import Enum
+from requests import Session
+from requests.adapters import HTTPAdapter
+from requests.auth import AuthBase
 from threading import Timer
-# import config
+from typing import Dict, Tuple, Any, Optional, Union
+from typing import List, Callable
+from urllib.parse import urljoin
+from urllib3.util.retry import Retry
 
 # Disable insecure warnings
 requests.packages.urllib3.disable_warnings()
 
+
+# Requests library configuration
+
+class AuthAdapter(AuthBase):
+    """Header-based authentication adapter for Requests sessions."""
+
+    def __init__(self, token, *, token_prefix="Bearer"):
+        self.token = token
+        self.value = f"{token_prefix} {token}"
+
+    def __call__(self, r):
+        r.headers["Authorization"] = self.value
+        return r
+
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    """An HTTPAdapter for request sessions that automatically includes a timeout."""
+
+    @property
+    def default_timeout(self):
+        return float(getattr(self, "_default_timeout", 30))
+
+    @default_timeout.setter
+    def default_timeout(self, value) -> None:
+        self._default_timeout = float(value)
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        # Apply the default timeout if one was not manually passed
+        if timeout is None:
+            timeout = self.default_timeout
+        return super().send(request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+
+
+# Configure a retry strategy. The requests library uses `b * (2 ** (i - 1))` where b is the backoff factor
+# and i is the retry attempt
+retry_strategy = Retry(
+    total=4,
+    backoff_factor=1.0,
+    status_forcelist=[408, 429, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "PUT", "POST", "PATCH", "DELETE", "TRACE"],
+)
+
+# A global adapter for connection pooling
+http_adapter = TimeoutHTTPAdapter(
+    pool_connections=10,  # The number of connection pools to cache
+    pool_maxsize=10,  # Max connections to a host for a connection pool.
+    max_retries=retry_strategy,
+)
+
+
+def log_request_errors(response, **kwargs):
+    """A requests hook for logging errors."""
+
+    def _truncate(text):
+        """Truncate a string to a max of 1024 chars."""
+        if len(text) > 1024:
+            return f"{text[:1024]}...({len(text) - 1024} truncated)"
+        else:
+            return text
+
+    if response.status_code >= 400:
+        try:
+            response_text = _truncate(response.text)
+        except Exception:
+            response_text = "**No response text given**"
+        LOG(f"[{response.status_code}] {response.url}: {response_text}")
+    return response
+
+
+def get_session():
+    """
+    Create a requests Session
+
+    Setup and return a requests session that uses the connection pool and appropriate retry strategy.
+    """
+    session = Session()
+    session.mount("http://", http_adapter)
+    session.mount("https://", http_adapter)
+    session.hooks["response"] = [log_request_errors]
+    return session
+
+
 ''' GLOBALS/PARAMS '''
 INTEGRATION_NAME = 'CrowdStrike Falcon'
-# demisto = config.demisto
-global demisto
-global demistox
-
-# print(globals().get('demisto'))
-print(f'CrowdStrike {demisto}')
-from CommonServerPython import *
 CLIENT_ID = demisto.params().get('client_id')
 SECRET = demisto.params().get('secret')
 # Remove trailing slash to prevent wrong URL path to service
@@ -43,6 +123,7 @@ HEADERS = {
     'Accept': 'application/json',
     'Authorization': 'Basic {}'.format(base64.b64encode(BYTE_CREDS).decode())
 }
+basic_auth_adapter = AuthAdapter(base64.b64encode(BYTE_CREDS).decode(), token_prefix="Basic")
 # Note: True life time of token is actually 30 mins
 TOKEN_LIFE_TIME = 28
 INCIDENTS_PER_FETCH = int(demisto.params().get('incidents_per_fetch', 15))
@@ -218,114 +299,119 @@ INTEGRATION_INSTANCE = demisto.integrationInstance()
 ''' HELPER FUNCTIONS '''
 
 
-def http_request(method, url_suffix, params=None, data=None, files=None, headers=HEADERS, safe=False,
-                 get_token_flag=True, no_json=False, json=None, status_code=None):
-    """
-        A wrapper for requests lib to send our requests and handle requests and responses better.
+class CloudStrikeFalconApi:
+    VALID_STATUS_CODES = {200, 201, 202, 204}
+    DEFAULT_HEADERS = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
 
-        :param json: JSON body
-        :type json ``dict`` or ``list``
+    def __init__(self, *, base_url, client_id, client_secret):
+        self.session = get_session()
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.base_url = base_url
+        self._request_timeout = 1
 
-        :type method: ``str``
-        :param method: HTTP method for the request.
+    def __del__(self):
+        """Make sure to close existing connections on exit."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
-        :type url_suffix: ``str``
-        :param url_suffix: The suffix of the URL (endpoint)
+    def handle_error_response(self, response):
+        res_json = response.json()
+        reason = response.reason
+        resources = res_json.get('resources', {})
+        if resources:
+            if isinstance(resources, list):
+                reason += f'\n{str(resources)}'
+            else:
+                for host_id, resource in resources.items():
+                    errors = resource.get('errors', [])
+                    if errors:
+                        error_message = errors[0].get('message')
+                        reason += f'\nHost ID {host_id} - {error_message}'
+        elif res_json.get('errors'):
+            errors = res_json.get('errors', [])
+            for error in errors:
+                reason += f"\n{error.get('message')}"
+        err_msg = f'Error in API call to CrowdStrike Falcon: code: {response.status_code} - reason: {reason}'
+        raise DemistoException(err_msg)
 
-        :type params: ``dict``
-        :param params: The URL params to be passed.
+    def _request(self, method: str, endpoint: str, *args, **kwargs):
+        valid_codes = kwargs.pop("valid_codes", ())  # Extra codes to consider valid
+        kwargs["headers"] = kwargs.pop("headers", {}).update(self.DEFAULT_HEADERS)
+        kwargs["auth"] = AuthAdapter(self.get_token())
+        kwargs.setdefault("timeout", self._request_timeout)
+        url = urljoin(self.base_url, endpoint)
+        response = self.session.request(method, url, *args, **kwargs)
+        if response.status_code in self.VALID_STATUS_CODES:
+            return response
+        elif response.status_code in valid_codes:
+            return response
+        else:
+            self.handle_error_response(response)
 
-        :type data: ``str``
-        :param data: The body data of the request.
+    def get(self, endpoint: str, *args, **kwargs):
+        return self._request("get", endpoint, *args, **kwargs)
 
-        :type headers: ``dict``
-        :param headers: Request headers
+    def post(self, endpoint: str, *args, **kwargs):
+        return self._request("post", endpoint, *args, **kwargs)
 
-        :type safe: ``bool``
-        :param safe: If set to true will return None in case of http error
+    def put(self, endpoint: str, *args, **kwargs):
+        return self._request("put", endpoint, *args, **kwargs)
 
-        :type get_token_flag: ``bool``
-        :param get_token_flag: If set to True will call get_token()
+    def patch(self, endpoint: str, *args, **kwargs):
+        return self._request("patch", endpoint, *args, **kwargs)
 
-        :type no_json: ``bool``
-        :param no_json: If set to true will not parse the content and will return the raw response object for successful
-        response
+    def delete(self, endpoint: str, *args, **kwargs):
+        return self._request("delete", endpoint, *args, **kwargs)
 
-        :type status_code: ``int``
-        :param: status_code: The request codes to accept as OK.
-
-        :return: Returns the http request response json
-        :rtype: ``dict``
-    """
-    if get_token_flag:
-        token = get_token()
-        headers['Authorization'] = 'Bearer {}'.format(token)
-    url = SERVER + url_suffix
-    try:
-        res = requests.request(
-            method,
+    def _request_token(self):
+        """Dispatch a request for a new authentication token."""
+        url = urljoin(self.base_url, "/oauth2/token")
+        response = self.session.post(
             url,
-            verify=USE_SSL,
-            params=params,
-            data=data,
-            headers=headers,
-            files=files,
-            json=json,
+            data={"client_id": self.client_id, "client_secret": self.client_secret},
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
         )
-    except requests.exceptions.RequestException as e:
-        return_error(f'Error in connection to the server. Please make sure you entered the URL correctly.'
-                     f' Exception is {str(e)}.')
-    try:
-        valid_status_codes = {200, 201, 202, 204}
-        # Handling a case when we want to return an entry for 404 status code.
-        if status_code:
-            valid_status_codes.add(status_code)
-        if res.status_code not in valid_status_codes:
-            res_json = res.json()
-            reason = res.reason
-            resources = res_json.get('resources', {})
-            if resources:
-                if isinstance(resources, list):
-                    reason += f'\n{str(resources)}'
-                else:
-                    for host_id, resource in resources.items():
-                        errors = resource.get('errors', [])
-                        if errors:
-                            error_message = errors[0].get('message')
-                            reason += f'\nHost ID {host_id} - {error_message}'
-            elif res_json.get('errors'):
-                errors = res_json.get('errors', [])
-                for error in errors:
-                    reason += f"\n{error.get('message')}"
-            err_msg = 'Error in API call to CrowdStrike Falcon: code: {code} - reason: {reason}'.format(
-                code=res.status_code,
-                reason=reason
+        if response.status_code not in {200, 201, 202, 204}:
+            raise Exception(
+                "Authorization Error: User has no authorization to create a token. Please make sure you entered "
+                "the credentials correctly."
             )
-            # try to create a new token
-            if res.status_code == 403 and get_token_flag:
-                LOG(err_msg)
-                token = get_token(new_token=True)
-                headers['Authorization'] = 'Bearer {}'.format(token)
-                return http_request(
-                    method=method,
-                    url_suffix=url_suffix,
-                    params=params,
-                    data=data,
-                    headers=headers,
-                    files=files,
-                    json=json,
-                    safe=safe,
-                    get_token_flag=False,
-                    status_code=status_code,
-                    no_json=no_json,
-                )
-            elif safe:
-                return None
-            raise DemistoException(err_msg)
-        return res if no_json else res.json()
-    except ValueError as exception:
-        raise ValueError(
-            f'Failed to parse json object from response: {exception} - {res.content}')  # type: ignore[str-bytes-safe]
+        else:
+            return response.json().get('access_token')
+
+    def get_token(self):
+        """
+        Retrieves the token from the server if it's expired and updates the global HEADERS to include it
+
+        :param new_token: If set to True will generate a new token regardless of time passed
+
+        :rtype: ``str``
+        :return: Token
+        """
+        now = datetime.now()
+        ctx = demisto.getIntegrationContext()
+        if ctx:
+            passed_mins = get_passed_mins(now, ctx.get('time'))
+            if passed_mins >= TOKEN_LIFE_TIME:
+                # token expired
+                auth_token = self._request_token()
+                demisto.setIntegrationContext({'auth_token': auth_token, 'time': date_to_timestamp(now) / 1000})
+            else:
+                # token hasn't expired
+                auth_token = ctx.get('auth_token')
+        else:
+            # there is no token
+            auth_token = self._request_token()
+            demisto.setIntegrationContext({'auth_token': auth_token, 'time': date_to_timestamp(now) / 1000})
+        return auth_token
+
+backend = CloudStrikeFalconApi(base_url=SERVER, client_id=CLIENT_ID, client_secret=SECRET)
 
 
 ''' API FUNCTIONS '''
@@ -548,7 +634,7 @@ def init_rtr_single_session(host_id: str) -> str:
     body = json.dumps({
         'device_id': host_id
     })
-    response = http_request('POST', endpoint_url, data=body)
+    response = backend.post(endpoint_url, data=body)
     resources = response.get('resources')
     if resources and isinstance(resources, list) and isinstance(resources[0], dict):
         session_id = resources[0].get('session_id')
@@ -564,10 +650,8 @@ def init_rtr_batch_session(host_ids: list) -> str:
         :return: The session batch ID to execute the command on
     """
     endpoint_url = '/real-time-response/combined/batch-init-session/v1'
-    body = json.dumps({
-        'host_ids': host_ids
-    })
-    response = http_request('POST', endpoint_url, data=body)
+    body = json.dumps({'host_ids': host_ids})
+    response = backend.post(endpoint_url, data=body)
     return response.get('batch_id')
 
 
@@ -578,11 +662,8 @@ def refresh_session(host_id: str) -> Dict:
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/entities/refresh-session/v1'
-
-    body = json.dumps({
-        'device_id': host_id
-    })
-    response = http_request('POST', endpoint_url, data=body)
+    body = json.dumps({'device_id': host_id})
+    response = backend.post(endpoint_url, data=body)
     return response
 
 
@@ -593,11 +674,8 @@ def batch_refresh_session(batch_id: str) -> None:
     """
     demisto.debug('Starting session refresh')
     endpoint_url = '/real-time-response/combined/batch-refresh-session/v1'
-
-    body = json.dumps({
-        'batch_id': batch_id
-    })
-    response = http_request('POST', endpoint_url, data=body)
+    body = json.dumps({'batch_id': batch_id })
+    response = backend.post(endpoint_url, data=body)
     demisto.debug(f'Refresh session response: {response}')
     demisto.debug('Finished session refresh')
 
@@ -611,13 +689,12 @@ def run_batch_read_cmd(batch_id: str, command_type: str, full_command: str) -> D
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/combined/batch-command/v1'
-
     body = json.dumps({
         'base_command': command_type,
         'batch_id': batch_id,
         'command_string': full_command
     })
-    response = http_request('POST', endpoint_url, data=body)
+    response = backend.post(endpoint_url, data=body)
     return response
 
 
@@ -631,7 +708,6 @@ def run_batch_write_cmd(batch_id: str, command_type: str, full_command: str, opt
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/combined/batch-active-responder-command/v1'
-
     default_body = {
         'base_command': command_type,
         'batch_id': batch_id,
@@ -641,7 +717,7 @@ def run_batch_write_cmd(batch_id: str, command_type: str, full_command: str, opt
         default_body['optional_hosts'] = optional_hosts  # type:ignore
 
     body = json.dumps(default_body)
-    response = http_request('POST', endpoint_url, data=body)
+    response = backend.post(endpoint_url, data=body)
     return response
 
 
@@ -657,11 +733,7 @@ def run_batch_admin_cmd(batch_id: str, command_type: str, full_command: str, tim
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/combined/batch-admin-command/v1'
-
-    params = {
-        'timeout': timeout
-    }
-
+    params = {'timeout': timeout}
     default_body = {
         'base_command': command_type,
         'batch_id': batch_id,
@@ -671,8 +743,7 @@ def run_batch_admin_cmd(batch_id: str, command_type: str, full_command: str, tim
         default_body['optional_hosts'] = optional_hosts  # type:ignore
 
     body = json.dumps(default_body)
-    response = http_request('POST', endpoint_url, data=body, params=params)
-    return response
+    return backend.post(endpoint_url, data=body, params=params)
 
 
 def run_batch_get_cmd(host_ids: list, file_path: str, optional_hosts: list = None, timeout: int = None,
@@ -694,7 +765,7 @@ def run_batch_get_cmd(host_ids: list, file_path: str, optional_hosts: list = Non
 
     body = assign_params(batch_id=batch_id, file_path=file_path, optional_hosts=optional_hosts)
     params = assign_params(timeout=timeout, timeout_duration=timeout_duration)
-    response = http_request('POST', endpoint_url, data=json.dumps(body), params=params)
+    response = backend.post(endpoint_url, data=json.dumps(body), params=params)
     return response
 
 
@@ -710,7 +781,7 @@ def status_get_cmd(request_id: str, timeout: int = None, timeout_duration: str =
     endpoint_url = '/real-time-response/combined/batch-get-command/v1'
 
     params = assign_params(timeout=timeout, timeout_duration=timeout_duration, batch_get_cmd_req_id=request_id)
-    response = http_request('GET', endpoint_url, params=params)
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -730,7 +801,7 @@ def run_single_read_cmd(host_id: str, command_type: str, full_command: str) -> D
         'command_string': full_command,
         'session_id': session_id
     })
-    response = http_request('POST', endpoint_url, data=body)
+    response = backend.post(endpoint_url, data=body)
     return response
 
 
@@ -749,7 +820,7 @@ def run_single_write_cmd(host_id: str, command_type: str, full_command: str) -> 
         'command_string': full_command,
         'session_id': session_id
     })
-    response = http_request('POST', endpoint_url, data=body)
+    response = backend.post(endpoint_url, data=body)
     return response
 
 
@@ -769,7 +840,7 @@ def run_single_admin_cmd(host_id: str, command_type: str, full_command: str) -> 
         'command_string': full_command,
         'session_id': session_id
     })
-    response = http_request('POST', endpoint_url, data=body)
+    response = backend.post(endpoint_url, data=body)
     return response
 
 
@@ -781,13 +852,11 @@ def status_read_cmd(request_id: str, sequence_id: Optional[int]) -> Dict:
         :param sequence_id: Sequence ID that we want to retrieve. Command responses are chunked across sequences
     """
     endpoint_url = '/real-time-response/entities/command/v1'
-
     params = {
         'cloud_request_id': request_id,
         'sequence_id': sequence_id or 0
     }
-
-    response = http_request('GET', endpoint_url, params=params)
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -799,13 +868,11 @@ def status_write_cmd(request_id: str, sequence_id: Optional[int]) -> Dict:
         :param sequence_id: Sequence ID that we want to retrieve. Command responses are chunked across sequences
     """
     endpoint_url = '/real-time-response/entities/active-responder-command/v1'
-
     params = {
         'cloud_request_id': request_id,
         'sequence_id': sequence_id or 0
     }
-
-    response = http_request('GET', endpoint_url, params=params)
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -817,13 +884,11 @@ def status_admin_cmd(request_id: str, sequence_id: Optional[int]) -> Dict:
         :param sequence_id: Sequence ID that we want to retrieve. Command responses are chunked across sequences
     """
     endpoint_url = '/real-time-response/entities/admin-command/v1'
-
     params = {
         'cloud_request_id': request_id,
         'sequence_id': sequence_id or 0
     }
-
-    response = http_request('GET', endpoint_url, params=params)
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -838,10 +903,8 @@ def list_host_files(host_id: str, session_id: str = None) -> Dict:
     if not session_id:
         session_id = init_rtr_single_session(host_id)
 
-    params = {
-        'session_id': session_id
-    }
-    response = http_request('GET', endpoint_url, params=params)
+    params = {'session_id': session_id}
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -860,6 +923,7 @@ def upload_script(name: str, permission_type: str, content: str, entry_id: str) 
         'permission_type': (None, permission_type)
     }
     temp_file = None
+    session = get_session()
     try:
         if content:
             body['content'] = (None, content)
@@ -869,13 +933,9 @@ def upload_script(name: str, permission_type: str, content: str, entry_id: str) 
             temp_file = open(file_.get('path'), 'rb')  # pylint: disable=E1101
             body['file'] = (file_name, temp_file)
 
-        headers = {
-            'Authorization': HEADERS['Authorization'],
-            'Accept': 'application/json'
-        }
-
-        response = http_request('POST', endpoint_url, files=body, headers=headers)
-
+        headers = {'Accept': 'application/json'}
+        with get_session() as session:
+            response = session.post(endpoint_url, auth=basic_auth_adapter, headers=headers)
         return response
     finally:
         if temp_file:
@@ -889,10 +949,8 @@ def get_script(script_id: list) -> Dict:
         :return: Response JSON which contains errors (if exist) and retrieved resource
     """
     endpoint_url = '/real-time-response/entities/scripts/v1'
-    params = {
-        'ids': script_id
-    }
-    response = http_request('GET', endpoint_url, params=params)
+    params = {'ids': script_id}
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -903,10 +961,8 @@ def delete_script(script_id: str) -> Dict:
         :return: Response JSON which contains errors (if exist) and how many resources were affected
     """
     endpoint_url = '/real-time-response/entities/scripts/v1'
-    params = {
-        'ids': script_id
-    }
-    response = http_request('DELETE', endpoint_url, params=params)
+    params = {'ids': script_id}
+    response = backend.delete(endpoint_url, params=params)
     return response
 
 
@@ -916,7 +972,7 @@ def list_scripts() -> Dict:
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/entities/scripts/v1'
-    response = http_request('GET', endpoint_url)
+    response = backend.get(endpoint_url)
     return response
 
 
@@ -936,7 +992,7 @@ def get_extracted_file(host_id: str, sha256: str, filename: str = None):
     if filename:
         params['filename'] = filename
 
-    response = http_request('GET', endpoint_url, params=params, no_json=True)
+    response = backend.get(endpoint_url, params=params, no_json=True)
     return response
 
 
@@ -958,11 +1014,9 @@ def upload_file(entry_id: str, description: str) -> Tuple:
             'description': (None, description),
             'file': (file_name, temp_file)
         }
-        headers = {
-            'Authorization': HEADERS['Authorization'],
-            'Accept': 'application/json'
-        }
-        response = http_request('POST', endpoint_url, files=body, headers=headers)
+        headers = {'Accept': 'application/json'}
+        with get_session() as session:
+            response = session.post(endpoint_url, auth=basic_auth_adapter, files=body, headers=headers)
         return response, file_name
     finally:
         if temp_file:
@@ -976,10 +1030,8 @@ def delete_file(file_id: str) -> Dict:
         :return: Response JSON which contains errors (if exist) and how many resources were affected
     """
     endpoint_url = '/real-time-response/entities/put-files/v1'
-    params = {
-        'ids': file_id
-    }
-    response = http_request('DELETE', endpoint_url, params=params)
+    params = {'ids': file_id}
+    response = backend.delete(endpoint_url, params=params)
     return response
 
 
@@ -990,10 +1042,8 @@ def get_file(file_id: list) -> Dict:
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/entities/put-files/v1'
-    params = {
-        'ids': file_id
-    }
-    response = http_request('GET', endpoint_url, params=params)
+    params = {'ids': file_id}
+    response = backend.get(endpoint_url, params=params)
     return response
 
 
@@ -1003,58 +1053,8 @@ def list_files() -> Dict:
         :return: Response JSON which contains errors (if exist) and retrieved resources
     """
     endpoint_url = '/real-time-response/entities/put-files/v1'
-    response = http_request('GET', endpoint_url)
+    response = backend.get(endpoint_url)
     return response
-
-
-def get_token(new_token=False):
-    """
-        Retrieves the token from the server if it's expired and updates the global HEADERS to include it
-
-        :param new_token: If set to True will generate a new token regardless of time passed
-
-        :rtype: ``str``
-        :return: Token
-    """
-    now = datetime.now()
-    ctx = demisto.getIntegrationContext()
-    if ctx and not new_token:
-        passed_mins = get_passed_mins(now, ctx.get('time'))
-        if passed_mins >= TOKEN_LIFE_TIME:
-            # token expired
-            auth_token = get_token_request()
-            demisto.setIntegrationContext({'auth_token': auth_token, 'time': date_to_timestamp(now) / 1000})
-        else:
-            # token hasn't expired
-            auth_token = ctx.get('auth_token')
-    else:
-        # there is no token
-        auth_token = get_token_request()
-        demisto.setIntegrationContext({'auth_token': auth_token, 'time': date_to_timestamp(now) / 1000})
-    return auth_token
-
-
-def get_token_request():
-    """
-        Sends token request
-
-        :rtype ``str``
-        :return: Access token
-    """
-    body = {
-        'client_id': CLIENT_ID,
-        'client_secret': SECRET
-    }
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
-    token_res = http_request('POST', '/oauth2/token', data=body, headers=headers, safe=True,
-                             get_token_flag=False)
-    if not token_res:
-        err_msg = 'Authorization Error: User has no authorization to create a token. Please make sure you entered the' \
-                  ' credentials correctly.'
-        raise Exception(err_msg)
-    return token_res.get('access_token')
 
 
 def get_detections(last_behavior_time=None, behavior_id=None, filter_arg=None):
@@ -1074,11 +1074,11 @@ def get_detections(last_behavior_time=None, behavior_id=None, filter_arg=None):
     if filter_arg:
         params['filter'] = filter_arg
     elif behavior_id:
-        params['filter'] = "behaviors.behavior_id:'{0}'".format(behavior_id)
+        params['filter'] = f"behaviors.behavior_id:'{behavior_id}'"
     elif last_behavior_time:
-        params['filter'] = "first_behavior:>'{0}'".format(last_behavior_time)
+        params['filter'] = f"first_behavior:>'{last_behavior_time}'"
 
-    response = http_request('GET', endpoint_url, params)
+    response = backend.get(endpoint_url, params)
     return response
 
 
@@ -1102,11 +1102,11 @@ def get_fetch_detections(last_created_timestamp=None, filter_arg=None, offset: i
     if filter_arg:
         params['filter'] = filter_arg
     elif last_created_timestamp:
-        params['filter'] = "created_timestamp:>'{0}'".format(last_created_timestamp)
+        params['filter'] = f"created_timestamp:>'{last_created_timestamp}'"
     elif last_updated_timestamp:
-        params['filter'] = "date_updated:>'{0}'".format(last_updated_timestamp)
+        params['filter'] = f"date_updated:>'{last_updated_timestamp}'"
 
-    response = http_request('GET', endpoint_url, params)
+    response = backend.get(endpoint_url, params)
 
     return response
 
@@ -1119,8 +1119,7 @@ def get_detections_entities(detections_ids: List):
     """
     ids_json = {'ids': detections_ids}
     if detections_ids:
-        response = http_request(
-            'POST',
+        response = backend.post(
             '/detects/entities/summaries/GET/v1',
             data=json.dumps(ids_json)
         )
@@ -1140,19 +1139,18 @@ def get_incidents_ids(last_created_timestamp=None, filter_arg=None, offset: int 
     if filter_arg:
         params['filter'] = filter_arg
     elif last_created_timestamp:
-        params['filter'] = "start:>'{0}'".format(last_created_timestamp)
+        params['filter'] = f"start:>'{last_created_timestamp}'"
     elif last_updated_timestamp:
-        params['filter'] = "modified_timestamp:>'{0}'".format(last_updated_timestamp)
+        params['filter'] = f"modified_timestamp:>'{last_updated_timestamp}'"
 
-    response = http_request('GET', get_incidents_endpoint, params)
+    response = backend.get(get_incidents_endpoint, params)
 
     return response
 
 
 def get_incidents_entities(incidents_ids: List):
     ids_json = {'ids': incidents_ids}
-    response = http_request(
-        'POST',
+    response = backend.post(
         '/incidents/entities/incidents/GET/v1',
         data=json.dumps(ids_json)
     )
@@ -1173,15 +1171,12 @@ def upload_ioc(ioc_type, value, policy=None, expiration_days=None,
         source=source,
         description=description,
     )
-
-    return http_request('POST', '/indicators/entities/iocs/v1', json=[payload])
+    return backend.post('/indicators/entities/iocs/v1', json=[payload])
 
 
 def update_ioc(ioc_type, value, policy=None, expiration_days=None,
                share_level=None, description=None, source=None):
-    """
-    Update an existing IOC
-    """
+    """Update an existing IOC"""
     body = assign_params(
         type=ioc_type,
         value=value,
@@ -1191,12 +1186,8 @@ def update_ioc(ioc_type, value, policy=None, expiration_days=None,
         source=source,
         description=description,
     )
-    params = assign_params(
-        type=ioc_type,
-        value=value
-    )
-
-    return http_request('PATCH', '/indicators/entities/iocs/v1', json=body, params=params)
+    params = assign_params(type=ioc_type, value=value)
+    return backend.patch('/indicators/entities/iocs/v1', json=body, params=params)
 
 
 def search_iocs(types=None, values=None, policies=None, sources=None, expiration_from=None,
@@ -1229,15 +1220,13 @@ def search_iocs(types=None, values=None, policies=None, sources=None, expiration
         if expiration_to:
             payload['to.expiration_timestamp'] = expiration_to
 
-        ids = http_request('GET', '/indicators/queries/iocs/v1', payload).get('resources')
+        ids = backend.get('/indicators/queries/iocs/v1', payload).get('resources')
         if not ids:
             return None
     else:
         ids = str(ids)
-    payload = {
-        'ids': ids
-    }
-    return http_request('GET', '/indicators/entities/iocs/v1', params=payload)
+    payload = {'ids': ids}
+    return backend.get('/indicators/entities/iocs/v1', params=payload)
 
 
 def enrich_ioc_dict_with_ids(ioc_dict):
@@ -1252,14 +1241,9 @@ def enrich_ioc_dict_with_ids(ioc_dict):
 
 
 def delete_ioc(ioc_type, value):
-    """
-    Delete an IOC
-    """
-    payload = assign_params(
-        type=ioc_type,
-        value=value
-    )
-    return http_request('DELETE', '/indicators/entities/iocs/v1', payload)
+    """Delete an IOC"""
+    payload = assign_params(type=ioc_type, value=value)
+    return backend.delete('/indicators/entities/iocs/v1', payload)
 
 
 def search_custom_iocs(
@@ -1297,12 +1281,12 @@ def search_custom_iocs(
         'limit': limit,
     }
 
-    return http_request('GET', '/iocs/combined/indicator/v1', params=params)
+    return backend.get('/iocs/combined/indicator/v1', params=params)
 
 
 def get_custom_ioc(ioc_id: str) -> dict:
     params = {'ids': ioc_id}
-    return http_request('GET', '/iocs/entities/indicators/v1', params=params)
+    return backend.get('/iocs/entities/indicators/v1', params=params)
 
 
 def update_custom_ioc(
@@ -1328,7 +1312,7 @@ def update_custom_ioc(
         )]
     }
 
-    return http_request('PATCH', '/iocs/entities/indicators/v1', json=payload)
+    return backend.patch('/iocs/entities/indicators/v1', json=payload)
 
 
 def delete_custom_ioc(ids: str) -> dict:
@@ -1336,7 +1320,7 @@ def delete_custom_ioc(ids: str) -> dict:
     Delete an IOC
     """
     params = {'ids': ids}
-    return http_request('DELETE', '/iocs/entities/indicators/v1', params=params)
+    return backend.delete('/iocs/entities/indicators/v1', params=params)
 
 
 def get_ioc_device_count(ioc_type, value):
@@ -1347,7 +1331,7 @@ def get_ioc_device_count(ioc_type, value):
         type=ioc_type,
         value=value
     )
-    response = http_request('GET', '/indicators/aggregates/devices-count/v1', payload, status_code=404)
+    response = backend.get('/indicators/aggregates/devices-count/v1', payload, valid_codes=(404, ))
     errors = response.get('errors', [])
     for error in errors:
         if error.get('code') == 404:
@@ -1360,7 +1344,7 @@ def get_process_details(ids):
     Get given processes details
     """
     payload = assign_params(ids=ids)
-    return http_request('GET', '/processes/entities/processes/v1', payload)
+    return backend.get('/processes/entities/processes/v1', payload)
 
 
 def get_proccesses_ran_on(ioc_type, value, device_id):
@@ -1372,7 +1356,7 @@ def get_proccesses_ran_on(ioc_type, value, device_id):
         value=value,
         device_id=device_id
     )
-    return http_request('GET', '/indicators/queries/processes/v1', payload)
+    return backend.get('/indicators/queries/processes/v1', payload)
 
 
 def search_device(filter_operator='AND'):
@@ -1411,11 +1395,11 @@ def search_device(filter_operator='AND'):
                 # All args should be a list. this is a fallback
                 url_filter = "{url_filter}{operator}{inp_arg}:'{arg_val}'".format(url_filter=url_filter, operator=op,
                                                                                   inp_arg=k, arg_val=arg)
-    raw_res = http_request('GET', '/devices/queries/devices/v1', params={'filter': url_filter})
-    device_ids = raw_res.get('resources')
+    raw_res = backend.get('/devices/queries/devices/v1', params={'filter': url_filter})
+    device_ids = raw_res.json().get('resources')
     if not device_ids:
         return None
-    return http_request('GET', '/devices/entities/devices/v1', params={'ids': device_ids})
+    return backend.get('/devices/entities/devices/v1', params={'ids': device_ids})
 
 
 def behavior_to_entry_context(behavior):
@@ -1435,7 +1419,7 @@ def get_username_uuid(username: str):
     :param username: Username to get UUID of.
     :return: The user UUID
     """
-    response = http_request('GET', '/users/queries/user-uuids-by-email/v1', params={'uid': username})
+    response = backend.get('/users/queries/user-uuids-by-email/v1', params={'uid': username})
     resources: list = response.get('resources', [])
     if not resources:
         raise ValueError(f'User {username} was not found')
@@ -1466,7 +1450,7 @@ def resolve_detection(ids, status, assigned_to_uuid, show_in_ui, comment):
     # We do this so show_in_ui value won't contain ""
     data = json.dumps(payload).replace('"show_in_ui": "false"', '"show_in_ui": false').replace('"show_in_ui": "true"',
                                                                                                '"show_in_ui": true')
-    return http_request('PATCH', '/detects/entities/detects/v2', data=data)
+    return backend.patch('/detects/entities/detects/v2', data=data)
 
 
 def contain_host(ids):
@@ -1475,14 +1459,10 @@ def contain_host(ids):
         :param ids: IDs of host to contain
         :return: Contain host response json
     """
-    payload = {
-        'ids': ids
-    }
+    payload = {'ids': ids}
     data = json.dumps(payload)
-    params = {
-        'action_name': 'contain'
-    }
-    return http_request('POST', '/devices/entities/devices-actions/v2', data=data, params=params)
+    params = {'action_name': 'contain'}
+    return backend.post('/devices/entities/devices-actions/v2', data=data, params=params)
 
 
 def lift_host_containment(ids):
@@ -1491,14 +1471,10 @@ def lift_host_containment(ids):
         :param ids: IDs of host to lift off containment from
         :return: Lift off containment response json
     """
-    payload = {
-        'ids': ids
-    }
+    payload = {'ids': ids}
     data = json.dumps(payload)
-    params = {
-        'action_name': 'lift_containment'
-    }
-    return http_request('POST', '/devices/entities/devices-actions/v2', data=data, params=params)
+    params = {'action_name': 'lift_containment'}
+    return backend.post('/devices/entities/devices-actions/v2', data=data, params=params)
 
 
 def timestamp_length_equalization(timestamp1, timestamp2):
@@ -1543,9 +1519,11 @@ def change_host_group(is_post: bool,
         "group_type": group_type,
         "assignment_rule": assignment_rule
     }]}
-    response = http_request(method=method,
-                            url_suffix='/devices/entities/host-groups/v1',
-                            json=data)
+    endpoint = '/devices/entities/host-groups/v1'
+    if is_post:
+        response = backend.post(endpoint, json=data)
+    else:
+        response = backend.patch(endpoint, json=data)
     return response
 
 
@@ -1558,10 +1536,8 @@ def change_host_group_members(action_name: str,
     data = {'action_parameters': [{'name': 'filter',
                                    'value': f"(device_id:{str(host_ids)})"}],
             'ids': [host_group_id]}
-    response = http_request(method='POST',
-                            url_suffix='/devices/entities/host-group-actions/v1',
-                            params={'action_name': action_name},
-                            json=data)
+    endpoint = '/devices/entities/host-group-actions/v1'
+    response = backend.post(endpoint, params={'action_name': action_name}, json=data)
     return response
 
 
@@ -1569,13 +1545,14 @@ def host_group_members(filter: Optional[str],
                        host_group_id: Optional[str],
                        limit: Optional[str],
                        offset: Optional[str]):
-    params = {'id': host_group_id,
-              'filter': filter,
-              'offset': offset,
-              'limit': limit}
-    response = http_request(method='GET',
-                            url_suffix='/devices/combined/host-group-members/v1',
-                            params=params)
+    params = {
+        'id': host_group_id,
+        'filter': filter,
+        'offset': offset,
+        'limit': limit,
+    }
+    endpoint = '/devices/combined/host-group-members/v1'
+    response = backend.get(endpoint, params=params)
     return response
 
 
@@ -1596,9 +1573,7 @@ def update_incident_request(ids: List[str], value: str, action_name: str):
         ],
         "ids": ids
     }
-    return http_request(method='POST',
-                        url_suffix='/incidents/entities/incident-actions/v1',
-                        json=data)
+    return backend.post('/incidents/entities/incident-actions/v1', json=data)
 
 
 def update_detection_request(ids: List[str], status: str) -> Dict:
@@ -1612,17 +1587,13 @@ def list_host_groups(filter: Optional[str], limit: Optional[str], offset: Option
     params = {'filter': filter,
               'offset': offset,
               'limit': limit}
-    response = http_request(method='GET',
-                            url_suffix='/devices/combined/host-groups/v1',
-                            params=params)
+    response = backend.get('/devices/combined/host-groups/v1', params=params)
     return response
 
 
 def delete_host_groups(host_group_ids: List[str]) -> Dict:
     params = {'ids': host_group_ids}
-    response = http_request(method='DELETE',
-                            url_suffix='/devices/entities/host-groups/v1',
-                            params=params)
+    response = backend.delete('/devices/entities/host-groups/v1', params=params)
     return response
 
 
@@ -1630,22 +1601,18 @@ def upload_batch_custom_ioc(ioc_batch: List[dict]) -> dict:
     """
     Upload a list of IOC
     """
-    payload = {
-        'indicators': ioc_batch
-    }
-
-    return http_request('POST', '/iocs/entities/indicators/v1', json=payload)
+    payload = {'indicators': ioc_batch}
+    return backend.post('/iocs/entities/indicators/v1', json=payload)
 
 
 def get_behaviors_by_incident(incident_id: str, params: dict = None) -> dict:
-    return http_request('GET', f'/incidents/queries/behaviors/v1?filter=incident_id:"{incident_id}"', params=params)
+    return backend.get(f'/incidents/queries/behaviors/v1?filter=incident_id:"{incident_id}"', params=params)
 
 
 def get_detections_by_behaviors(behaviors_id):
+    body = {'ids': behaviors_id}
     try:
-
-        body = {'ids': behaviors_id}
-        return http_request('POST', '/incidents/entities/behaviors/GET/v1', json=body)
+        return backend.get('/incidents/entities/behaviors/GET/v1', json=body)
     except Exception as e:
         demisto.error(f'Error occurred when trying to get detections by behaviors: {str(e)}')
         return {}
@@ -2425,7 +2392,7 @@ def search_device_command():
     raw_res = search_device()
     if not raw_res:
         return create_entry_object(hr='Could not find any devices.')
-    devices = raw_res.get('resources')
+    devices = raw_res.json().get('resources')
 
     command_results = []
     for single_device in devices:
@@ -3268,11 +3235,8 @@ def get_indicator_device_id():
     args = demisto.args()
     ioc_type = args.get('type')
     ioc_value = args.get('value')
-    params = assign_params(
-        type=ioc_type,
-        value=ioc_value
-    )
-    raw_res = http_request('GET', '/indicators/queries/devices/v1', params=params, status_code=404)
+    params = assign_params(type=ioc_type, value=ioc_value)
+    raw_res = backend.get('/indicators/queries/devices/v1', params=params, valid_codes=(404, ))
     errors = raw_res.get('errors', [])
     for error in errors:
         if error.get('code') == 404:
@@ -3510,9 +3474,8 @@ def upload_batch_custom_ioc_command(
 
 def test_module():
     try:
-        get_token(new_token=True)
-    except ValueError as ve:
-        logger.info(ve)
+        backend.get_token()
+    except ValueError:
         return 'Connection Error: The URL or The API key you entered is probably incorrect, please try again.'
     if demisto.params().get('isFetch'):
         try:
@@ -3815,7 +3778,7 @@ def get_detection_for_incident_command(incident_id: str) -> CommandResults:
 LOG('Command being called is {}'.format(demisto.command()))
 
 
-def main(ctx):
+def main():
     command = demisto.command()
     args = demisto.args()
     try:

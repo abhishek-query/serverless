@@ -4,9 +4,7 @@ Please notice that to add custom common code, add it to the CommonServerUserPyth
 Note that adding code to CommonServerUserPython can override functions in CommonServerPython
 """
 # If you change this section, make sure you update the line offset magic number
-global demisto
-global demistox
-print(f'CommonServer {demisto}')
+from __future__ import print_function
 
 import base64
 import gc
@@ -30,17 +28,12 @@ from distutils.version import LooseVersion
 from threading import Lock
 from inspect import currentframe
 
-# import demistomock as demisto
+import demistomock as demisto
 import warnings
-# import config
-# global demistox
-# demisto = demistox
-# demisto = config.demisto
-print('Hello Common Server')
+
 def __line__():
     cf = currentframe()
     return cf.f_back.f_lineno
-
 
 # 42 - The line offset from the beggining of the file.
 _MODULES_LINE_MAPPING = {

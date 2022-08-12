@@ -1,70 +1,75 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
+from typing import cast, Optional, Tuple
+from queryai.demisto import Demisto
+from queryai.logging import logger
 
-"""
-Purpose
+import json
 
-Shows how to implement an AWS Lambda function that handles input from direct
-invocation.
-"""
+# This is the common interface each driver implements. Since drivers are modules, there
+# is no way for the type checker to ensure they have `main`. But this interface is here
+# to document what we expect to be true, and to make the type checker happy when we call
+# `driver.main()`
+class Driver:
+    def main(self) -> None:
+        pass
 
-import logging, io, json
-import importlib, os
-from contextlib import redirect_stdout
-# import config
+def load_driver(name, context) -> Optional[Tuple[Driver, Demisto]]:
+    driver = None
 
-from DemistoClassApiModule.DemistoClassApiModule import Demisto
+    # This must be setup before any drivers are loaded
+    import queryai.demistomock as demisto
+    demisto.setup(context)
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+    # Drivers are in 'Packs/{name}/Integrations/{name}/{name}.py'. Previously we would load the
+    # source code, use `compile()`, then use `exec()`, but that has a non-zero risk of an attacker
+    # being able to make us run a Python script which we didn't intend to do. This also serves to
+    # validate the input.
+    #
+    # The downside is we'll have lots of if statements here. Maybe a better idea is to create a
+    # set with valid names and check for membership. If it belongs, then `open('Packs/{name}/..)`
+    # and compile/exec.
+    if name == 'CrowdStrikeFalcon':
+        import Packs.CrowdStrikeFalcon.Integrations.CrowdStrikeFalcon.CrowdStrikeFalcon as driver
+    if name == 'SplunkPy':
+        import Packs.SplunkPy.Integrations.SplunkPy.SplunkPy as driver
 
+    if driver is not None:
+        return (cast(Driver, driver), cast(Demisto, demisto))
 
-def lambda_handler(event, context):
-    """
-    :param event: The event dict that contains the parameters sent when the function
-                  is invoked.
-    :param context: The context in which the function is called.
-    :return: The result of the action.
-    """
-    # print(event)
-    body = event.get('body')
-    payload_dict = json.loads(body)
-    platform = payload_dict.get('connection')
-    cmd = payload_dict.get('command')
-    # ctx = {'command': cmd, 'args': event.get('args'), 'params': {'host': 'splunk.query.ai', 'port': '8089', 'authentication': {'identifier': 'admin', 'password': '#Irisiris20'}}, 'integration': True, 'IsDebug': False}
-    ctx = {'command': cmd, 'args': payload_dict.get('args'), 'params': payload_dict.get('params'), 'integration': True, 'IsDebug': False, 'context': {'IntegrationInstance': None}}
-    global demisto
-    demisto = Demisto(ctx)
-    # mod = importlib.import_module(f'Packs.{platform}.Integrations.{platform}.{platform}')
-    # import Packs.CrowdStrikeFalcon.Integrations.CrowdStrikeFalcon.CrowdStrikeFalcon as mod
-    # locals().update({'demisto':demisto})
-    print('importing Crowdstrike')
-    # with open('Packs/Base/Scripts/CommonServerPython/CommonServerPython.py') as csp:
-    # with open('Packs/CrowdStrikeFalcon/Integrations/CrowdStrikeFalcon/CrowdStrikeFalcon.py') as cs:
-    #   csCode = compile(cs.read(), 'CrowdSrtike.py', 'exec')
-    # exec(csCode, {'demisto': demisto, 'demistox': demisto})
-    COMMON_SERVER_SCRIPT = 'Packs/Base/Scripts/CommonServerPython/CommonServerPython.py'
-    platform_script = 'Packs/CrowdStrikeFalcon/Integrations/CrowdStrikeFalcon/CrowdStrikeFalcon.py'
-    with open(COMMON_SERVER_SCRIPT) as cs, open(platform_script) as ps:
-      csCode = compile(cs.read(), COMMON_SERVER_SCRIPT, 'exec')
-      exec(csCode, globals())
-      psCode = compile(ps.read(), platform_script, 'exec')
-      exec(psCode, globals())
+def lambda_handler(event, _):
+    body     = event.get('body')
+    payload  = json.loads(body)
+    cmd      = payload.get('command')
+    args     = payload.get('args')
+    params   = payload.get('params')
+    platform = payload.get('connection')
 
+    #tx = {'command': cmd, 'args': event.get('args'), 'params': {'host': 'splunk.query.ai', 'port': '8089', 'authentication': {'identifier': 'admin', 'password': '#Irisiris20'}}, 'integration': True, 'IsDebug': False}
+    ctx = {'command': cmd, 'args': args, 'params': params, 'integration': True, 'IsDebug': False, 'context': {'IntegrationInstance': None}}
 
-    result = demisto.output
+    driver = load_driver(platform, ctx)
+    if driver is None:
+        return {'result': 'error'}
+
+    (driver, demisto) = driver
+    driver.main()
+
+    # Demisto drivers use CommonServerPython.return_results, which eventually
+    # ends up writing the output to demistomock.output
+    return {'result': demisto.output}
+
+if __name__ == '__main__':
+    event = {
+        'body': json.dumps({
+            'command': 'cs-falcon-search-device',
+            'args':    {},
+            'params':  {
+                'client_id': '9f85fa0134374edea917c822caeeb507',
+                'secret':    'asFJot8V0rUPfT2l97mNkw1Z6iqhn3x5bOdW4gvX',
+                'url':       'https://api.crowdstrike.com'
+            },
+            'connection': 'CrowdStrikeFalcon'
+        })
+    }
+
+    result = lambda_handler(event, None)
     print(result)
-    # result = None
-    # try:
-    #     with redirect_stdout(io.StringIO()) as f:
-    #         mod.main()
-    #     result = f.getvalue()
-    #     # logger.info(result)
-    #     # result = mod.main(ctx)
-    # except SystemExit as se:
-    #     logger.error('System Exit Error')
-    return {'result': result}
-
-event = {'body': '{"command": "cs-falcon-search-device","args": {},"params": {"client_id": "9f85fa0134374edea917c822caeeb507","secret": "asFJot8V0rUPfT2l97mNkw1Z6iqhn3x5bOdW4gvX","url": "https://api.crowdstrike.com"},"connection": "CrowdStrikeFalcon"}'}
-result = lambda_handler(event, None)
-print(result)
